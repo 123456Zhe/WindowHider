@@ -1,0 +1,4 @@
+WindowHider.exe
+*.exe
+bin/
+obj/

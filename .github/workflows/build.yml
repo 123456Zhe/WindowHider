@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build WindowHider.exe
+        shell: cmd
+        # 直接用 Windows 自带的 C# 编译器，和本地 build.bat 同一条命令
+        run: '"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /t:winexe /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll /out:WindowHider.exe WindowHider.cs'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WindowHider-exe
+          path: WindowHider.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: WindowHider-exe
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/WindowHider.exe
+          generate_release_notes: true
