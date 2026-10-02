@@ -150,10 +150,12 @@ namespace WindowHider
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        // 注意：必须显式 CharSet.Unicode，否则默认按 ANSI 绑定 Module32FirstA，
+        // 与 Unicode 版 MODULEENTRY32 的 dwSize 对不上，枚举直接失败。
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool Module32First(IntPtr hSnapshot, ref MODULEENTRY32 lpme);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool Module32Next(IntPtr hSnapshot, ref MODULEENTRY32 lpme);
     }
 
