@@ -75,6 +75,9 @@ namespace WindowHider
         public static extern bool SetWindowDisplayAffinity(IntPtr hWnd, uint dwAffinity);
 
         [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool GetWindowDisplayAffinity(IntPtr hWnd, out uint pdwAffinity);
+
+        [DllImport("user32.dll", SetLastError = true)]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
         [DllImport("user32.dll")]
@@ -322,6 +325,24 @@ namespace WindowHider
                 Native.VirtualFreeEx(hProcess, remote, 0, Native.MEM_RELEASE);
 
                 if (exitCode == 0) { LastError = "目标进程内调用 API 失败"; return false; }
+                if (exitCode >= 0xC0000000)
+                {
+                    LastError = string.Format("目标进程内执行崩溃（异常码 0x{0:X8}），请截图反馈", exitCode);
+                    return false;
+                }
+
+                // 二次验证：跨进程直接读该窗口的 affinity（读是允许的）。
+                // 注意 Win10 2004 以下的系统会把 0x11 当作 WDA_MONITOR(1) 生效，
+                // 所以只要"非 0"就算设置成功，"0"算清除成功。
+                uint actual = 0;
+                if (Native.GetWindowDisplayAffinity(hwnd, out actual))
+                {
+                    bool expectHidden = (affinity != Native.WDA_NONE);
+                    bool isHidden = (actual != Native.WDA_NONE);
+                    if (expectHidden == isHidden) return true;
+                    LastError = "注入调用已执行，但系统未接受该窗口的隐身设置";
+                    return false;
+                }
                 return true;
             }
             finally { Native.CloseHandle(hProcess); }
@@ -363,9 +384,13 @@ namespace WindowHider
         }
 
         // x64: SetWindowDisplayAffinity(hwnd, affinity)
+        // 注意：CreateRemoteThread 启动时 RSP 是 8 字节对齐（RtlUserThreadStart 经 call 进入），
+        // 而 x64 ABI 要求 call 之前 RSP 必须 16 字节对齐，否则被调函数里一旦用 movaps 等对齐指令
+        // 就会崩溃（0xC0000005）。所以先 sub rsp,0x28（8 字节对齐 + 32 字节影子空间），调完恢复。
         static byte[] Build64(IntPtr hwnd, IntPtr func, uint affinity)
         {
             var sc = new List<byte>();
+            sc.AddRange(new byte[] { 0x48, 0x83, 0xEC, 0x28 });          // sub rsp, 0x28
             sc.AddRange(new byte[] { 0x48, 0xB9 });
             sc.AddRange(BitConverter.GetBytes(hwnd.ToInt64()));          // mov rcx, hwnd
             sc.AddRange(new byte[] { 0x48, 0xC7, 0xC2 });
@@ -373,6 +398,7 @@ namespace WindowHider
             sc.AddRange(new byte[] { 0x48, 0xB8 });
             sc.AddRange(BitConverter.GetBytes(func.ToInt64()));          // mov rax, func
             sc.AddRange(new byte[] { 0xFF, 0xD0 });                      // call rax
+            sc.AddRange(new byte[] { 0x48, 0x83, 0xC4, 0x28 });          // add rsp, 0x28
             sc.Add(0xC3);                                                // ret
             return sc.ToArray();
         }
@@ -424,7 +450,7 @@ namespace WindowHider
 
             var lblHelp = new Label()
             {
-                Text = "按住下面的准星不放，拖到任意窗口上松开，\r\n该窗口就会从截图 / 录屏 / 远程画面里隐身（变黑），\r\n你自己屏幕上照常显示。之后该程序新开的窗口会自动隐身。",
+                Text = "按住下面的准星不放，拖到任意窗口上松开，\r\n该窗口就会从截图 / 录屏 / 远程画面里隐身（Win10 2004+ 上截屏里直接透出后面内容），\r\n你自己屏幕上照常显示。之后该程序新开的窗口会自动隐身。",
                 Location = new Point(12, 10),
                 Size = new Size(516, 48),
             };
