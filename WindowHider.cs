@@ -21,6 +21,7 @@ using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 namespace WindowHider
@@ -465,6 +466,21 @@ namespace WindowHider
         // 已隐身的窗口句柄
         readonly HashSet<IntPtr> hiddenHwnds = new HashSet<IntPtr>();
 
+        // ---- 注入改异步后新增的状态（UI 线程与后台线程共享） ----
+        // 保护下面四个集合的锁
+        readonly object stateLock = new object();
+        // 串行化所有注入调用：Injector.LastError 是静态共享的，并发调用会互相覆盖
+        readonly object injectLock = new object();
+        // 注入失败的退避：exe（小写）-> 下次可重试的时间
+        readonly Dictionary<string, DateTime> retryAfter = new Dictionary<string, DateTime>();
+        // 连续失败次数：exe（小写）-> 次数
+        readonly Dictionary<string, int> failCount = new Dictionary<string, int>();
+        // 后台自动补隐身进行中（避免多轮重叠）
+        bool autoBusy = false;
+
+        const int MaxAutoRetries = 5;       // 同一 exe 连续失败 5 次后停止自动重试
+        const int MaxBackoffSeconds = 300;  // 退避上限 5 分钟
+
         public MainForm()
         {
             Text = "窗口隐身器";
@@ -663,58 +679,155 @@ namespace WindowHider
             string exe = ExeNameOf(pid);
             if (string.IsNullOrEmpty(exe)) { SetStatus("无法识别目标进程"); return; }
 
-            autoExes.Add(exe.ToLower());
-            int ok = 0, fail = 0;
-            foreach (var w in TopWindowsOf(pid))
+            lock (stateLock) { autoExes.Add(exe.ToLower()); }
+            IntPtr selfHandle = Handle;
+            SetStatus(exe + " 正在隐身…");
+            // 注入放后台线程：同步注入最长 5 秒/窗口，直接放 UI 线程会卡界面
+            ThreadPool.QueueUserWorkItem(_ =>
             {
-                if (hiddenHwnds.Contains(w)) { ok++; continue; }
-                if (Injector.SetAffinity(w, Native.WDA_EXCLUDEFROMCAPTURE))
-                { hiddenHwnds.Add(w); ok++; }
-                else fail++;
-            }
-            RefreshList();
-            if (fail > 0 && ok == 0)
-                SetStatus("失败：" + Injector.LastError);
-            else
-                SetStatus(string.Format("{0} 已隐身（{1} 个窗口），之后新开的窗口会自动隐身", exe, ok)
-                          + (fail > 0 ? string.Format("，{0} 个失败", fail) : ""));
+                int ok = 0, fail = 0;
+                string err = "";
+                foreach (var w in TopWindowsOf(pid, selfHandle))
+                {
+                    lock (stateLock) { if (hiddenHwnds.Contains(w)) { ok++; continue; } }
+                    bool done;
+                    lock (injectLock)
+                    {
+                        done = Injector.SetAffinity(w, Native.WDA_EXCLUDEFROMCAPTURE);
+                        if (!done) err = Injector.LastError;
+                    }
+                    if (done) { lock (stateLock) { hiddenHwnds.Add(w); } ok++; }
+                    else fail++;
+                }
+                SafeBeginInvoke(() =>
+                {
+                    RefreshList();
+                    if (fail > 0 && ok == 0)
+                        SetStatus("失败：" + err);
+                    else
+                        SetStatus(string.Format("{0} 已隐身（{1} 个窗口），之后新开的窗口会自动隐身", exe, ok)
+                                  + (fail > 0 ? string.Format("，{0} 个失败", fail) : ""));
+                });
+            });
         }
 
         void AutoProtectTick()
         {
-            if (autoExes.Count == 0) return;
-            bool changed = false;
-            // 清掉已关闭的窗口
-            var dead = new List<IntPtr>();
-            foreach (var h in hiddenHwnds)
-                if (!Native.IsWindow(h)) dead.Add(h);
-            foreach (var h in dead) { hiddenHwnds.Remove(h); changed = true; }
-
-            foreach (string exe in autoExes)
+            List<string> exes;
+            lock (stateLock)
             {
-                Process[] ps;
-                try { ps = Process.GetProcessesByName(exe); }
-                catch { continue; }
-                foreach (var p in ps)
-                {
-                    uint pid = (uint)p.Id;
-                    if (pid == (uint)Process.GetCurrentProcess().Id) continue;
-                    foreach (var w in TopWindowsOf(pid))
-                    {
-                        if (hiddenHwnds.Contains(w)) continue;
-                        if (Injector.SetAffinity(w, Native.WDA_EXCLUDEFROMCAPTURE))
-                        { hiddenHwnds.Add(w); changed = true; }
-                    }
-                    p.Dispose();
-                }
+                if (autoExes.Count == 0) return;
+                if (autoBusy) return; // 上一轮后台补隐身还没跑完，等下一轮
+                autoBusy = true;
+                exes = new List<string>(autoExes);
             }
-            if (changed) RefreshList();
+            IntPtr selfHandle = Handle;
+            // 注入放后台线程：WinForms Timer 回调跑在 UI 线程，同步注入会卡界面
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    bool changed = false;
+                    // 清掉已关闭的窗口
+                    var dead = new List<IntPtr>();
+                    lock (stateLock)
+                    {
+                        foreach (var h in hiddenHwnds)
+                            if (!Native.IsWindow(h)) dead.Add(h);
+                        foreach (var h in dead) { hiddenHwnds.Remove(h); changed = true; }
+                    }
+
+                    int selfPid;
+                    using (Process self = Process.GetCurrentProcess()) { selfPid = self.Id; }
+
+                    var gaveUp = new List<string>();
+                    foreach (string exe in exes)
+                    {
+                        // 退避中：跳过，等下一轮
+                        lock (stateLock)
+                        {
+                            DateTime t;
+                            if (retryAfter.TryGetValue(exe, out t) && DateTime.Now < t) continue;
+                        }
+                        Process[] ps;
+                        try { ps = Process.GetProcessesByName(exe); }
+                        catch { continue; }
+                        int attempted = 0, ok = 0;
+                        foreach (var p in ps)
+                        {
+                            uint pid = (uint)p.Id;
+                            if (pid == (uint)selfPid) { p.Dispose(); continue; }
+                            foreach (var w in TopWindowsOf(pid, selfHandle))
+                            {
+                                lock (stateLock) { if (hiddenHwnds.Contains(w)) continue; }
+                                attempted++;
+                                bool done;
+                                lock (injectLock)
+                                {
+                                    done = Injector.SetAffinity(w, Native.WDA_EXCLUDEFROMCAPTURE);
+                                }
+                                if (done)
+                                {
+                                    lock (stateLock) { hiddenHwnds.Add(w); }
+                                    ok++; changed = true;
+                                }
+                            }
+                            p.Dispose();
+                        }
+                        // 失败退避与重试上限：指数退避 10s/20s/40s/80s（上限 5 分钟），
+                        // 连续 5 次失败后停止自动重试（用户重新拖准星可再试）
+                        lock (stateLock)
+                        {
+                            if (attempted > 0 && ok == 0)
+                            {
+                                int n = 0;
+                                failCount.TryGetValue(exe, out n);
+                                n++;
+                                failCount[exe] = n;
+                                if (n >= MaxAutoRetries)
+                                {
+                                    autoExes.Remove(exe);
+                                    failCount.Remove(exe);
+                                    retryAfter.Remove(exe);
+                                    gaveUp.Add(exe);
+                                }
+                                else
+                                {
+                                    int delay = Math.Min(10 << (n - 1), MaxBackoffSeconds);
+                                    retryAfter[exe] = DateTime.Now.AddSeconds(delay);
+                                }
+                            }
+                            else if (ok > 0)
+                            {
+                                failCount.Remove(exe);
+                                retryAfter.Remove(exe);
+                            }
+                        }
+                    }
+
+                    if (changed || gaveUp.Count > 0)
+                    {
+                        SafeBeginInvoke(() =>
+                        {
+                            if (changed) RefreshList();
+                            if (gaveUp.Count > 0)
+                                SetStatus(string.Join("、", gaveUp.ToArray())
+                                    + " 连续 " + MaxAutoRetries + " 次注入失败，已停止自动重试（重新拖准星可再试）");
+                        });
+                    }
+                }
+                finally
+                {
+                    lock (stateLock) { autoBusy = false; }
+                }
+            });
         }
 
-        List<IntPtr> TopWindowsOf(uint pid)
+        // selfHandle 由调用方在 UI 线程传入，避免后台线程访问控件 Handle
+        List<IntPtr> TopWindowsOf(uint pid, IntPtr selfHandle)
         {
             var list = new List<IntPtr>();
-            IntPtr self = Handle;
+            IntPtr self = selfHandle;
             Native.EnumWindows((h, l) =>
             {
                 uint wpid; Native.GetWindowThreadProcessId(h, out wpid);
@@ -748,29 +861,41 @@ namespace WindowHider
             var item = lv.SelectedItems[0];
             string exe = item.SubItems[0].Text.ToLower();
             uint pid = uint.Parse(item.SubItems[1].Text);
-            foreach (var w in TopWindowsOf(pid))
+            foreach (var w in TopWindowsOf(pid, Handle))
             {
                 Injector.SetAffinity(w, Native.WDA_NONE);
-                hiddenHwnds.Remove(w);
+                lock (stateLock) { hiddenHwnds.Remove(w); }
             }
-            autoExes.Remove(exe);
+            lock (stateLock) { autoExes.Remove(exe); }
             RefreshList();
             SetStatus(exe + " 已还原");
         }
 
         void UnprotectAll()
         {
-            foreach (var h in new List<IntPtr>(hiddenHwnds))
+            // 关闭窗口时调用，保持同步（后台还原可能赶不上进程退出），
+            // 关闭时短暂卡顿可接受
+            List<IntPtr> snapshot;
+            lock (stateLock)
+            {
+                snapshot = new List<IntPtr>(hiddenHwnds);
+                hiddenHwnds.Clear();
+                autoExes.Clear();
+                failCount.Clear();
+                retryAfter.Clear();
+            }
+            foreach (var h in snapshot)
                 if (Native.IsWindow(h)) Injector.SetAffinity(h, Native.WDA_NONE);
-            hiddenHwnds.Clear();
-            autoExes.Clear();
             RefreshList();
         }
 
         void RefreshList()
         {
+            // 后台线程也会改 hiddenHwnds，先快照再枚举，避免"集合已修改"异常
+            List<IntPtr> snapshot;
+            lock (stateLock) { snapshot = new List<IntPtr>(hiddenHwnds); }
             lv.Items.Clear();
-            foreach (var h in hiddenHwnds)
+            foreach (var h in snapshot)
             {
                 if (!Native.IsWindow(h)) continue;
                 uint pid; Native.GetWindowThreadProcessId(h, out pid);
@@ -787,6 +912,16 @@ namespace WindowHider
         }
 
         void SetStatus(string s) { lblStatus.Text = s; }
+
+        // 后台线程回 UI 线程的安全封装：窗口已关闭时 BeginInvoke 会抛异常，直接忽略
+        void SafeBeginInvoke(MethodInvoker action)
+        {
+            try
+            {
+                if (!IsDisposed && IsHandleCreated) BeginInvoke(action);
+            }
+            catch { /* 窗口已关闭 */ }
+        }
     }
 
     // ---------------- 入口 ----------------
