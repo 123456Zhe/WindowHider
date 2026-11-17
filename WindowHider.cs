@@ -730,7 +730,15 @@ namespace WindowHider
 
         string ExeNameOf(uint pid)
         {
-            try { return Process.GetProcessById((int)pid).ProcessName; }
+            try
+            {
+                // Process 对象持有进程句柄，必须 Dispose；准星拖动时每鼠标移动
+                // 都会调一次，不释放就是每移动漏一个句柄。
+                using (Process p = Process.GetProcessById((int)pid))
+                {
+                    return p.ProcessName;
+                }
+            }
             catch { return ""; }
         }
 
