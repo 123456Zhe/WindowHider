@@ -861,14 +861,43 @@ namespace WindowHider
             var item = lv.SelectedItems[0];
             string exe = item.SubItems[0].Text.ToLower();
             uint pid = uint.Parse(item.SubItems[1].Text);
-            foreach (var w in TopWindowsOf(pid, Handle))
+            IntPtr selfHandle = Handle;
+            SetStatus(exe + "（PID " + pid + "）正在还原…");
+            // 还原注入同样放后台线程，避免 UI 卡顿（见 ProtectWindowPick）
+            ThreadPool.QueueUserWorkItem(_ =>
             {
-                Injector.SetAffinity(w, Native.WDA_NONE);
-                lock (stateLock) { hiddenHwnds.Remove(w); }
-            }
-            lock (stateLock) { autoExes.Remove(exe); }
-            RefreshList();
-            SetStatus(exe + " 已还原");
+                foreach (var w in TopWindowsOf(pid, selfHandle))
+                {
+                    lock (injectLock) { Injector.SetAffinity(w, Native.WDA_NONE); }
+                    lock (stateLock) { hiddenHwnds.Remove(w); }
+                }
+                bool stillProtected;
+                lock (stateLock)
+                {
+                    // 只删所选 PID 的保护：同名其他进程还有隐身窗口时，
+                    // 保留该 exe 的自动保护，否则它们的窗口残留隐身且新窗口不再自动补
+                    stillProtected = false;
+                    foreach (var h in hiddenHwnds)
+                    {
+                        uint wpid; Native.GetWindowThreadProcessId(h, out wpid);
+                        if (wpid != pid && string.Equals(ExeNameOf(wpid), exe, StringComparison.OrdinalIgnoreCase))
+                        { stillProtected = true; break; }
+                    }
+                    if (!stillProtected)
+                    {
+                        autoExes.Remove(exe);
+                        failCount.Remove(exe);
+                        retryAfter.Remove(exe);
+                    }
+                }
+                SafeBeginInvoke(() =>
+                {
+                    RefreshList();
+                    SetStatus(stillProtected
+                        ? exe + "（PID " + pid + "）已还原，同名其他进程继续自动保护"
+                        : exe + " 已还原");
+                });
+            });
         }
 
         void UnprotectAll()
