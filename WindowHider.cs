@@ -44,6 +44,10 @@ namespace WindowHider
         public const uint PAGE_EXECUTE_READWRITE = 0x40;
         public const uint MEM_RELEASE = 0x8000;
 
+        public const uint WAIT_OBJECT_0 = 0x00000000;
+        public const uint WAIT_TIMEOUT = 0x00000102;
+        public const uint STILL_ACTIVE = 259; // GetExitCodeThread 返回 259 表示线程仍在运行
+
         public const uint TH32CS_SNAPMODULE = 0x00000008;
         public const uint TH32CS_SNAPMODULE32 = 0x00000010;
         public const uint GA_ROOT = 2;
@@ -320,12 +324,31 @@ namespace WindowHider
                     LastError = "创建远程线程失败，错误码 " + Marshal.GetLastWin32Error(); return false;
                 }
 
-                Native.WaitForSingleObject(hThread, 5000);
+                uint waitResult = Native.WaitForSingleObject(hThread, 5000);
+                if (waitResult != Native.WAIT_OBJECT_0)
+                {
+                    // 超时（或等待失败）：远程线程可能还在执行 shellcode，
+                    // 此时释放远程内存会把线程正在执行的代码页抽走，导致目标进程崩溃。
+                    // 这块内存只有几十字节，故意不释放（泄漏），保进程不崩比省内存重要。
+                    // 注意 CloseHandle 只关闭我们这边的线程句柄，不会终止远程线程本身。
+                    Native.CloseHandle(hThread);
+                    LastError = waitResult == Native.WAIT_TIMEOUT
+                        ? "远程线程 5 秒内未结束，注入已取消（目标进程不受影响）"
+                        : "等待远程线程失败，错误码 " + Marshal.GetLastWin32Error();
+                    return false;
+                }
                 uint exitCode = 0;
                 Native.GetExitCodeThread(hThread, out exitCode);
                 Native.CloseHandle(hThread);
                 Native.VirtualFreeEx(hProcess, remote, 0, Native.MEM_RELEASE);
 
+                // STILL_ACTIVE(259) 表示线程仍在运行，不能当作成功（之前会漏过
+                // 下面两道检查被误判为成功）；正常等待返回后不应出现，这里做防御性检查。
+                if (exitCode == Native.STILL_ACTIVE)
+                {
+                    LastError = "远程线程仍在运行，注入结果未知";
+                    return false;
+                }
                 if (exitCode == 0) { LastError = "目标进程内调用 API 失败"; return false; }
                 if (exitCode >= 0xC0000000)
                 {
