@@ -477,6 +477,9 @@ namespace WindowHider
         readonly Dictionary<string, int> failCount = new Dictionary<string, int>();
         // 后台自动补隐身进行中（避免多轮重叠）
         bool autoBusy = false;
+        // 正在关闭（FormClosing 已触发）：后台隐身任务看到此标志立即停手，
+        // 否则可能在 UnprotectAll 还原之后又把窗口重新隐身
+        bool closing = false;
 
         const int MaxAutoRetries = 5;       // 同一 exe 连续失败 5 次后停止自动重试
         const int MaxBackoffSeconds = 300;  // 退避上限 5 分钟
@@ -596,7 +599,15 @@ namespace WindowHider
             autoTimer.Tick += (s, e) => AutoProtectTick();
             autoTimer.Start();
 
-            FormClosing += (s, e) => { UnprotectAll(); tray.Visible = false; tray.Dispose(); };
+            FormClosing += (s, e) =>
+            {
+                // 先停定时器并立关闭标志，再还原：在途的后台隐身任务看到标志会停手，
+                // 否则它可能在还原之后又把窗口重新隐身，进程一退就再也还原不了
+                autoTimer.Stop();
+                lock (stateLock) { closing = true; }
+                UnprotectAll();
+                tray.Visible = false; tray.Dispose();
+            };
         }
 
         // ---------- 准星拖拽（Spy++ 式） ----------
@@ -675,6 +686,7 @@ namespace WindowHider
         // ---------- 保护逻辑 ----------
         void ProtectWindowPick(IntPtr hwnd)
         {
+            lock (stateLock) { if (closing) return; }
             uint pid; Native.GetWindowThreadProcessId(hwnd, out pid);
             string exe = ExeNameOf(pid);
             if (string.IsNullOrEmpty(exe)) { SetStatus("无法识别目标进程"); return; }
@@ -689,6 +701,7 @@ namespace WindowHider
                 string err = "";
                 foreach (var w in TopWindowsOf(pid, selfHandle))
                 {
+                    lock (stateLock) { if (closing) return; }
                     lock (stateLock) { if (hiddenHwnds.Contains(w)) { ok++; continue; } }
                     bool done;
                     lock (injectLock)
@@ -716,6 +729,7 @@ namespace WindowHider
             List<string> exes;
             lock (stateLock)
             {
+                if (closing) return;
                 if (autoExes.Count == 0) return;
                 if (autoBusy) return; // 上一轮后台补隐身还没跑完，等下一轮
                 autoBusy = true;
@@ -759,6 +773,7 @@ namespace WindowHider
                             if (pid == (uint)selfPid) { p.Dispose(); continue; }
                             foreach (var w in TopWindowsOf(pid, selfHandle))
                             {
+                                lock (stateLock) { if (closing) return; }
                                 lock (stateLock) { if (hiddenHwnds.Contains(w)) continue; }
                                 attempted++;
                                 bool done;
@@ -914,7 +929,12 @@ namespace WindowHider
                 retryAfter.Clear();
             }
             foreach (var h in snapshot)
-                if (Native.IsWindow(h)) Injector.SetAffinity(h, Native.WDA_NONE);
+            {
+                if (!Native.IsWindow(h)) continue;
+                // 与后台隐身任务共用 injectLock：在途的隐身调用先完成、再被还原，
+                // 不会在还原之后又冒出来（配合 closing 标志，后续隐身调用已全部停手）
+                lock (injectLock) { Injector.SetAffinity(h, Native.WDA_NONE); }
+            }
             RefreshList();
         }
 
